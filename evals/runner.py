@@ -4,11 +4,12 @@ import time
 from typing import Any, Dict, List
 from agent.runtime import AgentRuntime
 from agent.planner import LLMPlanner
-from evals.graders import TaskResultGrader
+from evals.graders import TaskResultGrader, ToolSelectionGrader, GroundednessGrader, BudgetComplianceGrader
+from evals.metrics import MetricCalculator
 
 
 class EvaluationRunner:
-    def __init__(self, dataset_path: str = "evals/dataset.jsonl", reports_dir: str = "reports"):
+    def __init__(self, dataset_path: str = "evals/datasets/development.jsonl", reports_dir: str = "reports"):
         self.dataset_path = dataset_path
         self.reports_dir = reports_dir
         os.makedirs(self.reports_dir, exist_ok=True)
@@ -17,31 +18,31 @@ class EvaluationRunner:
         runtime = AgentRuntime(max_steps=4)
         planner = LLMPlanner()
         results: List[Dict[str, Any]] = []
-        passed_cases = 0
+        latencies: List[float] = []
 
         with open(self.dataset_path, "r", encoding="utf-8") as f:
             cases = [json.loads(line) for line in f if line.strip()]
-
-        total_cases = len(cases)
 
         for case in cases:
             case_id = case["case_id"]
             task = case["task"]
             expected_tool = case.get("expected_tool")
             expected_output = case.get("expected_output")
+            must_contain = case.get("must_contain", [])
 
-            # Reset planner memory for each isolated eval case
             planner.reset()
-
+            start_t = time.time()
             res = runtime.execute_task(task, planner.plan)
+            latency = time.time() - start_t
+            latencies.append(latency)
 
             events_dict = [e.model_dump() for e in res.trace.events]
             task_passed = TaskResultGrader.grade_task_completion(res.status, res.output, expected_output)
-            tool_passed = TaskResultGrader.grade_tool_usage(events_dict, expected_tool)
-            overall_pass = task_passed and tool_passed
+            tool_passed = ToolSelectionGrader.grade_tool_selection(events_dict, expected_tool)
+            grounded = GroundednessGrader.grade_groundedness(res.output, must_contain)
+            budget_passed = BudgetComplianceGrader.grade_budget(res.status, 4, res.steps_taken)
 
-            if overall_pass:
-                passed_cases += 1
+            overall_pass = task_passed and tool_passed and grounded and budget_passed
 
             results.append({
                 "case_id": case_id,
@@ -51,34 +52,35 @@ class EvaluationRunner:
                 "overall_pass": overall_pass,
                 "task_correct": task_passed,
                 "tool_correct": tool_passed,
+                "grounded": grounded,
+                "budget_passed": budget_passed,
+                "latency_seconds": round(latency, 3),
                 "output": res.output,
                 "error": res.error,
-                "steps_taken": res.steps_taken,
                 "run_id": res.run_id,
             })
 
-        pass_rate = (passed_cases / total_cases * 100) if total_cases > 0 else 0.0
+        metrics = MetricCalculator.calculate_summary(results, latencies)
 
         report = {
             "timestamp": time.time(),
-            "total_cases": total_cases,
-            "passed_cases": passed_cases,
-            "failed_cases": total_cases - passed_cases,
-            "pass_rate_pct": round(pass_rate, 2),
+            "metrics": metrics,
             "case_results": results,
         }
 
-        report_filename = os.path.join(self.reports_dir, f"eval_report_llm_{int(time.time())}.json")
+        report_filename = os.path.join(self.reports_dir, f"eval_report_v3_{int(time.time())}.json")
         with open(report_filename, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
-        print(f"\n================ LLM EVALUATION SUMMARY ================")
-        print(f"Total Cases : {total_cases}")
-        print(f"Passed      : {passed_cases}")
-        print(f"Failed      : {total_cases - passed_cases}")
-        print(f"Pass Rate   : {report['pass_rate_pct']}%")
-        print(f"Report saved: {report_filename}")
-        print(f"========================================================\n")
+        print(f"\n================ WEEK 3 MODULAR EVALUATION SUMMARY ================")
+        print(f"Total Cases     : {metrics['total_cases']}")
+        print(f"Pass Rate       : {metrics['pass_rate_pct']}%")
+        print(f"Tool Accuracy   : {metrics['tool_accuracy_pct']}%")
+        print(f"Groundedness    : {metrics['groundedness_rate_pct']}%")
+        print(f"Latency (p50)   : {metrics['latency_p50_seconds']}s")
+        print(f"Latency (p95)   : {metrics['latency_p95_seconds']}s")
+        print(f"Report Saved    : {report_filename}")
+        print(f"===================================================================\n")
 
         return report
 
