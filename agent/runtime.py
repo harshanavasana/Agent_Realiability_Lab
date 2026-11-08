@@ -1,8 +1,12 @@
 import time
+import uuid
 from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from agent.tools import get_tool
 from agent.traces import RunTrace
+from harness.state import StateManager, AgentState
+from harness.policies import check_tool_permission, PermissionLevel
+from harness.retries import execute_with_retry
 from observability.logging import get_logger
 from observability.telemetry import get_tracer
 from storage.repository import RunRepository
@@ -30,9 +34,11 @@ class AgentRuntime:
     def __init__(self, max_steps: int = 5, timeout_seconds: float = 30.0):
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.state_mgr = StateManager()
 
     def execute_task(self, task: str, planner_fn) -> RunResult:
         with tracer.start_as_current_span("agent_run") as parent_span:
+            self.state_mgr.transition_to(AgentState.RUNNING)
             parent_span.set_attribute("task", task)
             trace_obj = RunTrace(task=task, max_steps=self.max_steps)
             start_time = time.time()
@@ -45,6 +51,7 @@ class AgentRuntime:
             while step < self.max_steps:
                 elapsed = time.time() - start_time
                 if elapsed > self.timeout_seconds:
+                    self.state_mgr.transition_to(AgentState.FAILED)
                     trace_obj.status = "TIMEOUT"
                     trace_obj.end_time = time.time()
                     trace_obj.log_event(step=step, event_type="RUN_TIMEOUT", payload={"elapsed": elapsed})
@@ -66,6 +73,7 @@ class AgentRuntime:
                     try:
                         action: Optional[Action] = planner_fn(task, step)
                     except Exception as e:
+                        self.state_mgr.transition_to(AgentState.FAILED)
                         trace_obj.status = "FAILED"
                         trace_obj.end_time = time.time()
                         trace_obj.log_event(step=step, event_type="PLANNER_ERROR", payload={"error": str(e)})
@@ -80,6 +88,7 @@ class AgentRuntime:
                         return res
 
                     if action is None:
+                        self.state_mgr.transition_to(AgentState.COMPLETED)
                         trace_obj.status = "SUCCESS"
                         trace_obj.end_time = time.time()
                         trace_obj.log_event(step=step, event_type="RUN_COMPLETE", payload={"result": final_output})
@@ -99,10 +108,36 @@ class AgentRuntime:
                         payload={"tool_name": action.tool_name, "tool_input": action.tool_input},
                     )
 
+                    # Check permission level before execution
+                    perm = check_tool_permission(action.tool_name)
+                    if perm == PermissionLevel.DESTRUCTIVE:
+                        self.state_mgr.transition_to(AgentState.FAILED)
+                        error_msg = f"Security Policy Violation: Tool '{action.tool_name}' requires approval."
+                        trace_obj.log_event(
+                            step=step,
+                            event_type="PERMISSION_VIOLATION",
+                            payload={"tool_name": action.tool_name},
+                        )
+                        trace_obj.status = "FAILED"
+                        trace_obj.end_time = time.time()
+                        res = RunResult(
+                            run_id=trace_obj.run_id,
+                            status="FAILED",
+                            error=error_msg,
+                            steps_taken=step,
+                            trace=trace_obj,
+                        )
+                        repo.save_run(res)
+                        return res
+
                     try:
                         tool = get_tool(action.tool_name)
-                        tool_result = tool.execute(action.tool_input)
+                        tool_result = execute_with_retry(lambda: tool.execute(action.tool_input))
                         final_output = tool_result.result
+
+                        # Persist execution checkpoint
+                        chk_id = str(uuid.uuid4())
+                        repo.save_checkpoint(chk_id, trace_obj.run_id, step, "STEP_COMPLETED", str(final_output))
 
                         trace_obj.log_event(
                             step=step,
@@ -110,6 +145,7 @@ class AgentRuntime:
                             payload={"tool_name": action.tool_name, "result": tool_result.result},
                         )
                     except Exception as e:
+                        self.state_mgr.transition_to(AgentState.FAILED)
                         trace_obj.log_event(
                             step=step,
                             event_type="TOOL_EXECUTION_FAILED",
@@ -127,6 +163,7 @@ class AgentRuntime:
                         repo.save_run(res)
                         return res
 
+            self.state_mgr.transition_to(AgentState.FAILED)
             trace_obj.status = "MAX_STEPS_EXCEEDED"
             trace_obj.end_time = time.time()
             trace_obj.log_event(step=step, event_type="MAX_STEPS_REACHED", payload={"max_steps": self.max_steps})
