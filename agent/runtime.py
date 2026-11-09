@@ -1,8 +1,19 @@
 import time
+import uuid
 from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from agent.tools import get_tool
 from agent.traces import RunTrace
+from harness.state import StateManager, AgentState
+from harness.policies import check_tool_permission, PermissionLevel
+from harness.retries import execute_with_retry
+from observability.logging import get_logger
+from observability.telemetry import get_tracer
+from storage.repository import RunRepository
+
+logger = get_logger("agent.runtime")
+tracer = get_tracer()
+repo = RunRepository()
 
 
 class Action(BaseModel):
@@ -23,97 +34,145 @@ class AgentRuntime:
     def __init__(self, max_steps: int = 5, timeout_seconds: float = 30.0):
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.state_mgr = StateManager()
 
     def execute_task(self, task: str, planner_fn) -> RunResult:
-        trace = RunTrace(task=task, max_steps=self.max_steps)
-        start_time = time.time()
-        step = 0
-        final_output = None
+        with tracer.start_as_current_span("agent_run") as parent_span:
+            self.state_mgr.transition_to(AgentState.RUNNING)
+            parent_span.set_attribute("task", task)
+            trace_obj = RunTrace(task=task, max_steps=self.max_steps)
+            start_time = time.time()
+            step = 0
+            final_output = None
 
-        trace.log_event(step=0, event_type="RUN_STARTED", payload={"task": task, "max_steps": self.max_steps})
+            logger.info(f"Starting task execution: {task}", extra={"payload": {"task": task}})
+            trace_obj.log_event(step=0, event_type="RUN_STARTED", payload={"task": task, "max_steps": self.max_steps})
 
-        while step < self.max_steps:
-            elapsed = time.time() - start_time
-            if elapsed > self.timeout_seconds:
-                trace.status = "TIMEOUT"
-                trace.end_time = time.time()
-                trace.log_event(step=step, event_type="RUN_TIMEOUT", payload={"elapsed_seconds": elapsed})
-                return RunResult(
-                    run_id=trace.run_id,
-                    status="TIMEOUT",
-                    error=f"Execution timed out after {elapsed:.2f}s",
-                    steps_taken=step,
-                    trace=trace,
-                )
+            while step < self.max_steps:
+                elapsed = time.time() - start_time
+                if elapsed > self.timeout_seconds:
+                    self.state_mgr.transition_to(AgentState.FAILED)
+                    trace_obj.status = "TIMEOUT"
+                    trace_obj.end_time = time.time()
+                    trace_obj.log_event(step=step, event_type="RUN_TIMEOUT", payload={"elapsed": elapsed})
+                    res = RunResult(
+                        run_id=trace_obj.run_id,
+                        status="TIMEOUT",
+                        error=f"Execution timed out after {elapsed:.2f}s",
+                        steps_taken=step,
+                        trace=trace_obj,
+                    )
+                    repo.save_run(res)
+                    return res
 
-            step += 1
-            trace.total_steps = step
+                step += 1
+                trace_obj.total_steps = step
 
-            try:
-                action: Optional[Action] = planner_fn(task, step)
-            except Exception as e:
-                trace.status = "FAILED"
-                trace.end_time = time.time()
-                trace.log_event(step=step, event_type="PLANNER_ERROR", payload={"error": str(e)})
-                return RunResult(
-                    run_id=trace.run_id,
-                    status="FAILED",
-                    error=f"Planner error: {str(e)}",
-                    steps_taken=step,
-                    trace=trace,
-                )
+                with tracer.start_as_current_span(f"step_{step}") as step_span:
+                    step_span.set_attribute("step", step)
+                    try:
+                        action: Optional[Action] = planner_fn(task, step)
+                    except Exception as e:
+                        self.state_mgr.transition_to(AgentState.FAILED)
+                        trace_obj.status = "FAILED"
+                        trace_obj.end_time = time.time()
+                        trace_obj.log_event(step=step, event_type="PLANNER_ERROR", payload={"error": str(e)})
+                        res = RunResult(
+                            run_id=trace_obj.run_id,
+                            status="FAILED",
+                            error=f"Planner error: {str(e)}",
+                            steps_taken=step,
+                            trace=trace_obj,
+                        )
+                        repo.save_run(res)
+                        return res
 
-            if action is None:
-                trace.status = "SUCCESS"
-                trace.end_time = time.time()
-                trace.log_event(step=step, event_type="RUN_COMPLETE", payload={"result": final_output})
-                return RunResult(
-                    run_id=trace.run_id,
-                    status="SUCCESS",
-                    output=final_output,
-                    steps_taken=step - 1,
-                    trace=trace,
-                )
+                    if action is None:
+                        self.state_mgr.transition_to(AgentState.COMPLETED)
+                        trace_obj.status = "SUCCESS"
+                        trace_obj.end_time = time.time()
+                        trace_obj.log_event(step=step, event_type="RUN_COMPLETE", payload={"result": final_output})
+                        res = RunResult(
+                            run_id=trace_obj.run_id,
+                            status="SUCCESS",
+                            output=final_output,
+                            steps_taken=step - 1,
+                            trace=trace_obj,
+                        )
+                        repo.save_run(res)
+                        return res
 
-            trace.log_event(
-                step=step,
-                event_type="PLANNER_DECISION",
-                payload={"tool_name": action.tool_name, "tool_input": action.tool_input},
+                    trace_obj.log_event(
+                        step=step,
+                        event_type="PLANNER_DECISION",
+                        payload={"tool_name": action.tool_name, "tool_input": action.tool_input},
+                    )
+
+                    # Check permission level before execution
+                    perm = check_tool_permission(action.tool_name)
+                    if perm == PermissionLevel.DESTRUCTIVE:
+                        self.state_mgr.transition_to(AgentState.FAILED)
+                        error_msg = f"Security Policy Violation: Tool '{action.tool_name}' requires approval."
+                        trace_obj.log_event(
+                            step=step,
+                            event_type="PERMISSION_VIOLATION",
+                            payload={"tool_name": action.tool_name},
+                        )
+                        trace_obj.status = "FAILED"
+                        trace_obj.end_time = time.time()
+                        res = RunResult(
+                            run_id=trace_obj.run_id,
+                            status="FAILED",
+                            error=error_msg,
+                            steps_taken=step,
+                            trace=trace_obj,
+                        )
+                        repo.save_run(res)
+                        return res
+
+                    try:
+                        tool = get_tool(action.tool_name)
+                        tool_result = execute_with_retry(lambda: tool.execute(action.tool_input))
+                        final_output = tool_result.result
+
+                        # Persist execution checkpoint
+                        chk_id = str(uuid.uuid4())
+                        repo.save_checkpoint(chk_id, trace_obj.run_id, step, "STEP_COMPLETED", str(final_output))
+
+                        trace_obj.log_event(
+                            step=step,
+                            event_type="TOOL_EXECUTION_SUCCESS",
+                            payload={"tool_name": action.tool_name, "result": tool_result.result},
+                        )
+                    except Exception as e:
+                        self.state_mgr.transition_to(AgentState.FAILED)
+                        trace_obj.log_event(
+                            step=step,
+                            event_type="TOOL_EXECUTION_FAILED",
+                            payload={"tool_name": action.tool_name, "error": str(e)},
+                        )
+                        trace_obj.status = "FAILED"
+                        trace_obj.end_time = time.time()
+                        res = RunResult(
+                            run_id=trace_obj.run_id,
+                            status="FAILED",
+                            error=str(e),
+                            steps_taken=step,
+                            trace=trace_obj,
+                        )
+                        repo.save_run(res)
+                        return res
+
+            self.state_mgr.transition_to(AgentState.FAILED)
+            trace_obj.status = "MAX_STEPS_EXCEEDED"
+            trace_obj.end_time = time.time()
+            trace_obj.log_event(step=step, event_type="MAX_STEPS_REACHED", payload={"max_steps": self.max_steps})
+            res = RunResult(
+                run_id=trace_obj.run_id,
+                status="MAX_STEPS_EXCEEDED",
+                error=f"Exceeded maximum allowed steps ({self.max_steps})",
+                steps_taken=step,
+                trace=trace_obj,
             )
-
-            try:
-                tool = get_tool(action.tool_name)
-                tool_result = tool.execute(action.tool_input)
-                final_output = tool_result.result
-
-                trace.log_event(
-                    step=step,
-                    event_type="TOOL_EXECUTION_SUCCESS",
-                    payload={"tool_name": action.tool_name, "result": tool_result.result},
-                )
-            except Exception as e:
-                trace.log_event(
-                    step=step,
-                    event_type="TOOL_EXECUTION_FAILED",
-                    payload={"tool_name": action.tool_name, "error": str(e)},
-                )
-                trace.status = "FAILED"
-                trace.end_time = time.time()
-                return RunResult(
-                    run_id=trace.run_id,
-                    status="FAILED",
-                    error=str(e),
-                    steps_taken=step,
-                    trace=trace,
-                )
-
-        trace.status = "MAX_STEPS_EXCEEDED"
-        trace.end_time = time.time()
-        trace.log_event(step=step, event_type="MAX_STEPS_REACHED", payload={"max_steps": self.max_steps})
-        return RunResult(
-            run_id=trace.run_id,
-            status="MAX_STEPS_EXCEEDED",
-            error=f"Exceeded maximum allowed steps ({self.max_steps})",
-            steps_taken=step,
-            trace=trace,
-        )
+            repo.save_run(res)
+            return res

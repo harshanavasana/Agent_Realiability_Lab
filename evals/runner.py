@@ -5,16 +5,19 @@ from typing import Any, Dict, List
 from agent.runtime import AgentRuntime
 from agent.planner import LLMPlanner
 from evals.graders import TaskResultGrader, ToolSelectionGrader, GroundednessGrader, BudgetComplianceGrader
+from evals.graders.trajectory import TrajectoryEvaluator
+from evals.graders.llm_judge import LLMJudge
 from evals.metrics import MetricCalculator
 
 
-class EvaluationRunner:
+class ComprehensiveEvaluationRunner:
     def __init__(self, dataset_path: str = "evals/datasets/development.jsonl", reports_dir: str = "reports"):
         self.dataset_path = dataset_path
         self.reports_dir = reports_dir
         os.makedirs(self.reports_dir, exist_ok=True)
+        self.judge = LLMJudge()
 
-    def run_evaluations(self) -> Dict[str, Any]:
+    def run_evaluations(self, use_llm_judge: bool = False) -> Dict[str, Any]:
         runtime = AgentRuntime(max_steps=4)
         planner = LLMPlanner()
         results: List[Dict[str, Any]] = []
@@ -42,7 +45,16 @@ class EvaluationRunner:
             grounded = GroundednessGrader.grade_groundedness(res.output, must_contain)
             budget_passed = BudgetComplianceGrader.grade_budget(res.status, 4, res.steps_taken)
 
-            overall_pass = task_passed and tool_passed and grounded and budget_passed
+            # Evaluate Trajectory Path
+            traj_score = TrajectoryEvaluator.evaluate_trajectory(events_dict, optimal_steps=1)
+
+            # Optional LLM Judge Evaluation
+            judge_res = None
+            if use_llm_judge and res.output is not None:
+                judge_eval = self.judge.evaluate(task, res.output, expected_output)
+                judge_res = judge_eval.model_dump()
+
+            overall_pass = task_passed and tool_passed and grounded and budget_passed and traj_score.is_efficient
 
             results.append({
                 "case_id": case_id,
@@ -54,6 +66,8 @@ class EvaluationRunner:
                 "tool_correct": tool_passed,
                 "grounded": grounded,
                 "budget_passed": budget_passed,
+                "trajectory_score": traj_score.model_dump(),
+                "llm_judge": judge_res,
                 "latency_seconds": round(latency, 3),
                 "output": res.output,
                 "error": res.error,
@@ -68,23 +82,22 @@ class EvaluationRunner:
             "case_results": results,
         }
 
-        report_filename = os.path.join(self.reports_dir, f"eval_report_v3_{int(time.time())}.json")
+        report_filename = os.path.join(self.reports_dir, f"eval_report_v6_{int(time.time())}.json")
         with open(report_filename, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
-        print(f"\n================ WEEK 3 MODULAR EVALUATION SUMMARY ================")
-        print(f"Total Cases     : {metrics['total_cases']}")
-        print(f"Pass Rate       : {metrics['pass_rate_pct']}%")
-        print(f"Tool Accuracy   : {metrics['tool_accuracy_pct']}%")
-        print(f"Groundedness    : {metrics['groundedness_rate_pct']}%")
-        print(f"Latency (p50)   : {metrics['latency_p50_seconds']}s")
-        print(f"Latency (p95)   : {metrics['latency_p95_seconds']}s")
-        print(f"Report Saved    : {report_filename}")
-        print(f"===================================================================\n")
+        print(f"\n================ WEEK 6 COMPREHENSIVE EVALUATION SUMMARY ================")
+        print(f"Total Cases       : {metrics['total_cases']}")
+        print(f"Pass Rate         : {metrics['pass_rate_pct']}%")
+        print(f"Tool Accuracy     : {metrics['tool_accuracy_pct']}%")
+        print(f"Groundedness      : {metrics['groundedness_rate_pct']}%")
+        print(f"Latency (p50)     : {metrics['latency_p50_seconds']}s")
+        print(f"Report Saved      : {report_filename}")
+        print(f"=========================================================================\n")
 
         return report
 
 
 if __name__ == "__main__":
-    runner = EvaluationRunner()
+    runner = ComprehensiveEvaluationRunner()
     runner.run_evaluations()

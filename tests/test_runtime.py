@@ -25,7 +25,8 @@ def test_unauthorized_tool():
 
     result = runtime.execute_task("Malicious action", planner)
     assert result.status == "FAILED"
-    assert "not in the allowlist" in result.error
+    # Accommodate both Week 1 allowlist lookup failure and Week 5 policy checks
+    assert ("not in the allowlist" in result.error) or ("Security Policy Violation" in result.error)
 
 
 def test_valid_search_args():
