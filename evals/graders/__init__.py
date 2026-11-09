@@ -25,7 +25,6 @@ class ToolSelectionGrader:
 class GroundednessGrader:
     @staticmethod
     def grade_groundedness(output: Optional[str], must_contain: List[str]) -> bool:
-        """Verifies that the agent's output contains key evidence strings from retrieved documents."""
         if output is None:
             return True if not must_contain else False
         output_lower = output.lower()
